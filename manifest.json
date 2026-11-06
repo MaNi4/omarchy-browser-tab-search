@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "mani4.browser-tab-search",
+  "name": "Browser Tab Search",
+  "version": "1.0.0",
+  "author": "MaNi4",
+  "license": "MIT",
+  "description": "Find any open browser tab from anywhere. One shortcut opens a launcher with all your tabs, plus recently closed tabs, bookmarks and history. Press Enter to jump to the tab. You can also close, mute and pin tabs, open an address, or search the web. For Chromium-based browsers such as Brave and Chromium (not Google Chrome)",
+  "kinds": [
+    "overlay",
+    "service"
+  ],
+  "entryPoints": {
+    "overlay": "BrowserTabSearch.qml",
+    "service": "Service.qml"
+  },
+  "homepage": "https://github.com/MaNi4/omarchy-browser-tab-search",
+  "keepLoaded": true
+}

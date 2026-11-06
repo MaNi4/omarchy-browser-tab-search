@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Omarchy Browser Tab Search",
+  "version": "1.0.0",
+  "description": "Lets Omarchy's Browser Tab Search find your open tabs, recently closed tabs, bookmarks and history, and switch to the one you pick.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4waS3KGdQ5WuZbsZQRnz0enSKlUi87CymNh47jCE2rq7+VzkQ2nZclKwp0XJWPu8lgzBSR6A1KUcGAJfMukiin43NqoXgmacnjgqMe0Kk1McijRDwBdKdTGyNCbqCAgMM9sM9mKzUd3bbIrloPrbvDYu4a3vup0h+h8x9fa/Zk6rPodazOJzp4wHgc1+MWE1fYyYU7pLot3+mfV/FhEgvXw8Osy6MyN6fvJIL5UvE8/nQ+b9J4rXptvVVWmep6cXDK35SEVUBl/QnDkHwbpR6kt5C/urziTlgpoYHtz5VdF2GejcZ5FGuR00UUyIbKDC2pWeNU1KRLy/mZ6t09mnzQIDAQAB",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabs",
+    "nativeMessaging",
+    "favicon",
+    "alarms",
+    "bookmarks",
+    "history",
+    "sessions",
+    "search"
+  ],
+  "background": {
+    "service_worker": "worker-1.js"
+  },
+  "icons": {
+    "128": "icon.png"
+  }
+}

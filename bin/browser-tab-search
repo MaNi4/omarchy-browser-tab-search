@@ -1,0 +1,885 @@
+#!/usr/bin/env python3
+"""Browser Tab Search: list the open tabs of Chromium-family browsers and switch to one.
+
+Two programs in one file:
+
+* The native messaging host. The browser starts it for the extension in
+  ../extension (argv[1] is then the extension's origin). It keeps a Unix
+  socket in $XDG_RUNTIME_DIR/browser-tab-search open for as long as the browser runs
+  and relays each request on it to the extension.
+
+* The command the panel runs:
+    browser-tab-search list               every tab of every connected browser, as JSON
+    browser-tab-search activate KEY TAB   switch to a tab and focus its window
+    browser-tab-search dedupe KEY TAB     close the other tabs showing the same page
+    browser-tab-search tabs ACTION KEY:TAB...
+                                  close, mute, unmute, pin or unpin tabs
+    browser-tab-search move KEY TAB STEP  move a pinned tab one place (STEP 1 or -1)
+    browser-tab-search restore KEY ID     reopen a recently closed tab or window
+    browser-tab-search open KEY TOKEN     open a bookmark or history entry found by serve
+    browser-tab-search web KEY            search in that browser; stdin holds
+                                  {"query": words, "url": "https://…%s…" or ""},
+                                  or {"address": "https://…"} to open as it is
+    browser-tab-search serve              search bookmarks and history: one JSON request
+                                  per line on stdin, so the query is not in argv
+    browser-tab-search save-config        write the settings (JSON on stdin) to
+                                  ~/.config/omarchy/extensions/browser-tab-search.json, 0600
+    browser-tab-search connect            register the host and load the extension
+    browser-tab-search disconnect         undo connect
+  KEY names a browser's socket as `list` printed it; TAB is a tab id.
+"""
+
+import json
+import os
+import re
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+# Goes up together with "version" in extension/chromium/manifest.json. A host older
+# than this one answers new commands with "unknown command".
+VERSION = "1.0.0"
+EXTENSION_ID = "ppcfhppcfeaknjmekgeipmppoiaemoho"
+HOST_NAME = "com.mani4.tab_search"
+ORIGIN = "chrome-extension://" + EXTENSION_ID + "/"
+
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+# Two folders down: the marketplace takes a manifest.json at the top or one
+# folder down for a plugin of its own.
+EXTENSION_DIR = os.path.join(PLUGIN_DIR, "extension", "chromium")
+SELF = os.path.realpath(__file__)
+
+MAX_FROM_BROWSER = 8 * 1024 * 1024   # one message from the extension
+MAX_REQUEST = 4096                   # one request line on the socket
+MAX_REPLY = 8 * 1024 * 1024          # one reply line read by the command
+REPLY_TIMEOUT = 3.0
+SOCKET_RE = re.compile(r"^(\d+)-(\d+)\.sock$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+TAB_COMMANDS = ("activate", "dedupe")
+BROWSER_COMMANDS = ("list", "search", "open", "restore", "tabs", "move", "web") + TAB_COMMANDS
+WEB_URL_RE = re.compile(r"^https?://\S+$")
+TAB_ACTIONS = ("close", "mute", "unmute", "pin", "unpin")
+MAX_TABS = 500
+
+CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+# The settings: the key, what is listed, the searches (BrowserTabSearch.qml).
+CONFIG_FILE = os.path.join(CONFIG, "omarchy", "extensions", "browser-tab-search.json")
+MAX_CONFIG = 64 * 1024
+
+# Profile roots of Chromium-family browsers; a host manifest goes into the
+# ones that exist.
+# Google Chrome is left out: since version 137 its official builds ignore
+# --load-extension, which is how the extension is loaded.
+BROWSER_DIRS = [
+    "chromium",
+    "BraveSoftware/Brave-Browser",
+    "BraveSoftware/Brave-Browser-Beta",
+    "BraveSoftware/Brave-Browser-Nightly",
+    "BraveSoftware/Brave-Origin",
+    "microsoft-edge",
+    "microsoft-edge-dev",
+    "vivaldi",
+]
+
+# Start-up flag files their launchers read.
+FLAG_FILES = [
+    "brave-origin-flags.conf",
+    "brave-flags.conf",
+    "chromium-flags.conf",
+    "microsoft-edge-stable-flags.conf",
+    "vivaldi-stable.conf",
+]
+
+# Web app windows carry their own class, such as brave-teams.cloud.microsoft__-Default.
+APP_CLASS_RE = re.compile(r"^(brave|chrome|chromium|msedge|vivaldi)-.+-(Default|Profile[_ ]?\d+)$", re.I)
+ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+
+
+# --------------------------------------------------------------- shared
+
+def socket_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.join(base, "browser-tab-search")
+
+
+def ensure_socket_dir():
+    path = socket_dir()
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise SystemExit("browser-tab-search: %s is not a directory of this user" % path)
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+    return path
+
+
+def browser_name(pid):
+    try:
+        exe = os.path.realpath("/proc/%d/exe" % pid).lower()
+    except OSError:
+        exe = ""
+    for needle, name in (("brave-origin", "Brave Origin"), ("brave", "Brave"), ("vivaldi", "Vivaldi"),
+                         ("edge", "Edge"), ("chromium", "Chromium"), ("chrome", "Chrome")):
+        if needle in exe:
+            return name
+    return "Browser"
+
+
+# --------------------------------------------------------------- host
+
+def run_host(origin):
+    if origin != ORIGIN:
+        sys.exit(1)
+    os.umask(0o077)
+    import asyncio  # only the host needs it, and it is slow to import
+    globals()["asyncio"] = asyncio
+    try:
+        asyncio.run(host())
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+
+
+async def host():
+    loop = asyncio.get_running_loop()
+    browser_pid = os.getppid()
+    name = browser_name(browser_pid)
+    directory = ensure_socket_dir()
+    path = os.path.join(directory, "%d-%d.sock" % (browser_pid, os.getpid()))
+
+    reader = asyncio.StreamReader(limit=MAX_FROM_BROWSER)
+    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
+    out = sys.stdout.buffer
+    pending = {}
+    counter = [0]
+
+    def to_browser(message):
+        data = json.dumps(message).encode()
+        out.write(struct.pack("<I", len(data)) + data)
+        out.flush()
+
+    async def serve(r, w):
+        request_id = None
+        try:
+            sock = w.get_extra_info("socket")
+            creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            if struct.unpack("3i", creds)[1] != os.getuid():
+                return
+            line = await asyncio.wait_for(r.readline(), 2)
+            if len(line) > MAX_REQUEST:
+                return
+            request = json.loads(line)
+            command = request.get("cmd")
+            if command not in BROWSER_COMMANDS:
+                reply = {"error": "unknown command"}
+            else:
+                counter[0] += 1
+                request_id = counter[0]
+                message = {"id": request_id, "cmd": command}
+                if command in TAB_COMMANDS:
+                    message["tabId"] = int(request.get("tabId"))
+                elif command in ("search", "web"):
+                    message["query"] = str(request.get("query") or "")[:200]
+                    if command == "web":
+                        url = str(request.get("url") or "")
+                        if url and not WEB_URL_RE.match(url):
+                            raise ValueError("bad url")
+                        message["url"] = url[:2048]
+                elif command == "open":
+                    message["token"] = int(request.get("token"))
+                elif command == "tabs":
+                    action = str(request.get("action") or "")
+                    ids = request.get("tabIds")
+                    if action not in TAB_ACTIONS or not isinstance(ids, list) or len(ids) > MAX_TABS:
+                        raise ValueError("bad tabs request")
+                    message["action"] = action
+                    message["tabIds"] = [int(i) for i in ids]
+                elif command == "move":
+                    step = int(request.get("step"))
+                    if step not in (1, -1):
+                        raise ValueError("bad step")
+                    message["tabId"] = int(request.get("tabId"))
+                    message["step"] = step
+                elif command == "restore":
+                    session = str(request.get("sessionId") or "")
+                    if not SESSION_RE.match(session):
+                        raise ValueError("bad session id")
+                    message["sessionId"] = session
+                future = loop.create_future()
+                pending[request_id] = future
+                to_browser(message)
+                reply = await asyncio.wait_for(future, REPLY_TIMEOUT)
+                reply.pop("id", None)
+            reply["browser"] = name
+            reply["host"] = VERSION
+            reply["pid"] = browser_pid
+            w.write(json.dumps(reply).encode() + b"\n")
+            await w.drain()
+        except (asyncio.TimeoutError, ValueError, TypeError, OSError, AttributeError):
+            pass
+        finally:
+            if request_id is not None:
+                pending.pop(request_id, None)
+            w.close()
+
+    if os.path.lexists(path):
+        os.unlink(path)
+    server = await asyncio.start_unix_server(serve, path=path)
+    os.chmod(path, 0o600)
+    try:
+        while True:
+            head = await reader.readexactly(4)
+            size = struct.unpack("<I", head)[0]
+            if size > MAX_FROM_BROWSER:
+                break
+            body = await reader.readexactly(size)
+            try:
+                message = json.loads(body)
+            except ValueError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            future = pending.pop(message.get("id"), None)
+            if future and not future.done():
+                future.set_result(message)
+    except (asyncio.IncompleteReadError, ConnectionError):
+        pass  # the browser closed, or the extension let go
+    finally:
+        server.close()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------- talking to hosts
+
+def ask(path, request, timeout=REPLY_TIMEOUT + 1):
+    """One request to one host. Returns the reply, or None."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.connect(path)
+        except ConnectionRefusedError:
+            # Its host is gone without cleaning up.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            return None
+        except OSError:
+            return None
+        try:
+            sock.sendall(json.dumps(request).encode() + b"\n")
+            chunks = []
+            size = 0
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_REPLY:
+                    return None
+                if chunk.endswith(b"\n"):
+                    break
+        except OSError:
+            return None
+    try:
+        reply = json.loads(b"".join(chunks))
+    except ValueError:
+        return None
+    return reply if isinstance(reply, dict) else None
+
+
+def sockets():
+    directory = socket_dir()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    return sorted(name for name in names if SOCKET_RE.match(name))
+
+
+def socket_path(key):
+    if not SOCKET_RE.match(key or ""):
+        raise SystemExit("browser-tab-search: bad browser key")
+    return os.path.join(socket_dir(), key)
+
+
+# --------------------------------------------------------------- list
+
+def clean_text(value, limit):
+    text = str(value or "")
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    return text[:limit]
+
+
+def tighten_config():
+    """A settings file written by hand, or before it was kept 0600, is made
+    readable only by the user. Only when needed: Browser Tab Search watches the
+    file, and every chmod shows up as a change."""
+    try:
+        info = os.stat(CONFIG_FILE)
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) & 0o077:
+            os.chmod(CONFIG_FILE, stat.S_IMODE(info.st_mode) & 0o700)
+    except OSError:
+        pass
+
+
+def command_list():
+    tighten_config()
+    keys = sockets()
+    replies = {}
+
+    def fetch(key):
+        replies[key] = ask(os.path.join(socket_dir(), key), {"cmd": "list"})
+
+    threads = [threading.Thread(target=fetch, args=(key,)) for key in keys]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    tabs = []
+    closed = []
+    icons = {}
+    browsers = []
+    for key in keys:
+        reply = replies.get(key)
+        if not reply or not isinstance(reply.get("tabs"), list):
+            continue
+        name = clean_text(reply.get("browser"), 40)
+        browsers.append({"key": key, "name": name, "windows": int(reply.get("windows") or 0),
+                         "outdated": reply.get("host") != VERSION})
+        take_icons(reply, icons)
+        for entry in (reply.get("closed") or [])[:20]:
+            if not isinstance(entry, dict) or not SESSION_RE.match(str(entry.get("sessionId") or "")):
+                continue
+            closed.append({
+                "key": key,
+                "sessionId": str(entry["sessionId"]),
+                "browser": name,
+                "title": clean_text(entry.get("title"), 512),
+                "url": clean_text(entry.get("url"), 2048),
+                "origin": clean_text(entry.get("origin"), 300),
+                "tabs": int(entry.get("tabs") or 1),
+                "closedAt": float(entry.get("closedAt") or 0),
+            })
+        for tab in reply["tabs"]:
+            if not isinstance(tab, dict) or not isinstance(tab.get("id"), int):
+                continue
+            tabs.append({
+                "key": key,
+                "id": tab["id"],
+                "browser": name,
+                "window": int(tab.get("window") or 0),
+                "index": int(tab.get("index") or 0),
+                "title": clean_text(tab.get("title"), 512),
+                "url": clean_text(tab.get("url"), 2048),
+                "origin": clean_text(tab.get("origin"), 300),
+                "active": bool(tab.get("active")),
+                "focusedWindow": bool(tab.get("focusedWindow")),
+                "pinned": bool(tab.get("pinned")),
+                "audible": bool(tab.get("audible")),
+                "muted": bool(tab.get("muted")),
+                "incognito": bool(tab.get("incognito")),
+                "asleep": bool(tab.get("asleep")),
+                "lastAccessed": float(tab.get("lastAccessed") or 0),
+            })
+
+    closed.sort(key=lambda c: -c["closedAt"])
+    # With several browsers, only the one whose window was focused last has a
+    # tab "in front"; new tabs and the Alt+Tab order go by it.
+    if len(browsers) > 1:
+        last = last_focused(browsers)
+        for tab in tabs:
+            if tab["key"] != last:
+                tab["focusedWindow"] = False
+    names = instance_names(browsers)
+    for item in browsers:
+        item["name"] = names.get(item["key"], item["name"])
+    for item in tabs + closed:
+        item["browser"] = names.get(item["key"], item["browser"])
+    result = {"status": "ok" if browsers else "none", "browsers": browsers, "tabs": tabs, "closed": closed, "icons": icons}
+    if not browsers:
+        result["setup"] = setup_state()
+    json.dump(result, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def last_focused(browsers):
+    """The key of the browser whose window Hyprland focused most recently."""
+    rank = {}
+    for client in hypr_clients():
+        try:
+            pid, order = int(client.get("pid") or 0), int(client.get("focusHistoryID"))
+        except (TypeError, ValueError):
+            continue
+        if order >= 0 and (pid not in rank or order < rank[pid]):
+            rank[pid] = order
+    best = None
+    for b in browsers:
+        order = rank.get(int(SOCKET_RE.match(b["key"]).group(1)))
+        if order is not None and (best is None or order < best[0]):
+            best = (order, b["key"])
+    return best[1] if best else browsers[0]["key"]
+
+
+def instance_names(browsers):
+    """Names for browsers of the same kind running more than once, as separate
+    instances or profiles: the profile folder they run with, else a number."""
+    out = {}
+    by_name = {}
+    for b in browsers:
+        by_name.setdefault(b["name"], []).append(b["key"])
+    for name, keys in by_name.items():
+        if len(keys) < 2:
+            continue
+        labels = [user_data_dir(int(SOCKET_RE.match(k).group(1))) for k in keys]
+        for n, (key, label) in enumerate(zip(keys, labels)):
+            unique = label and labels.count(label) == 1
+            out[key] = clean_text("%s (%s)" % (name, label) if unique else "%s %d" % (name, n + 1), 60)
+    return out
+
+
+def user_data_dir(pid):
+    """The last part of --user-data-dir, or "default" without one."""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            line = f.read(1 << 20).decode("utf-8", "replace")
+    except OSError:
+        return ""
+    # Chromium rewrites its command line into one string with spaces.
+    match = re.search(r"--user-data-dir[= \0]([^\0 ]+)", line)
+    return os.path.basename(match.group(1).rstrip("/"))[:40] if match else "default"
+
+
+# A favicon as the launcher shows it: a small raster image, inline. SVG is
+# left out, being a document of its own rather than a picture.
+ICON_RE = re.compile(r"^data:image/(png|jpeg|gif|webp|x-icon|vnd\.microsoft\.icon);base64,[A-Za-z0-9+/]+={0,2}$")
+
+
+def take_icons(reply, icons):
+    for icon_origin, data in (reply.get("icons") or {}).items():
+        if isinstance(data, str) and len(data) <= 12000 and ICON_RE.match(data):
+            icons[clean_text(icon_origin, 300)] = data
+
+
+# --------------------------------------------------------------- serve (bookmarks and history)
+
+# Bookmarklets and inline pages are not offered: opening one from here
+# would run it, or show what it hides.
+SCRIPT_URL_RE = re.compile(r"^\s*(javascript|data|vbscript):", re.I)
+
+
+def found_items(items, key, kind):
+    out = []
+    for item in (items or [])[:20]:
+        if not isinstance(item, dict) or not isinstance(item.get("token"), int):
+            continue
+        if SCRIPT_URL_RE.match(str(item.get("url") or "")):
+            continue
+        out.append({
+            "key": key,
+            "token": item["token"],
+            "kind": kind,
+            "title": clean_text(item.get("title"), 512),
+            "url": clean_text(item.get("url"), 2048),
+            "origin": clean_text(item.get("origin"), 300),
+            "folder": clean_text(item.get("folder"), 120),
+        })
+    return out
+
+
+def command_serve():
+    """Each stdin line {"seq": n, "query": "..."} gets one stdout line back."""
+    for line in sys.stdin:
+        if len(line) > MAX_REQUEST:
+            continue
+        try:
+            request = json.loads(line)
+            seq = int(request.get("seq") or 0)
+            query = str(request.get("query") or "")[:200]
+        except (ValueError, TypeError, AttributeError):
+            continue
+        replies = {}
+        keys = sockets()
+
+        def fetch(key):
+            replies[key] = ask(os.path.join(socket_dir(), key), {"cmd": "search", "query": query})
+
+        threads = [threading.Thread(target=fetch, args=(key,)) for key in keys]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        result = {"seq": seq, "bookmarks": [], "history": [], "icons": {}}
+        for key in keys:
+            reply = replies.get(key)
+            if not reply:
+                continue
+            result["bookmarks"] += found_items(reply.get("bookmarks"), key, "bookmark")
+            result["history"] += found_items(reply.get("history"), key, "history")
+            take_icons(reply, result["icons"])
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def setup_state():
+    manifests = [d for d in BROWSER_DIRS if os.path.isfile(manifest_path(d))]
+    flags = [f for f in FLAG_FILES if extension_loaded(os.path.join(CONFIG, f))]
+    running = set()
+    stale = set()   # running since before the extension was added to its flags
+    loaded = set()  # started with the extension, which still does not answer
+    for client in hypr_clients():
+        name = str(client.get("class", ""))
+        if not browser_class(name):
+            continue
+        running.add(name)
+        if flags:
+            (loaded if started_with_extension(int(client.get("pid") or 0)) else stale).add(name)
+    return {"manifests": len(manifests) > 0, "flags": flags, "running": sorted(running),
+            "stale": sorted(stale), "loaded": sorted(loaded)}
+
+
+def started_with_extension(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            return extension_in_cmdline(handle.read(1 << 20).decode(errors="replace"))
+    except OSError:
+        return True   # cannot tell; do not claim otherwise
+
+
+def extension_in_cmdline(text):
+    """Whether a browser's /proc cmdline loads this extension. Chromium and
+    Brave rewrite theirs into one string with spaces, others keep the NULs;
+    the extension's path has no spaces (connect refuses one that has)."""
+    args = [a for a in text.split("\0") if a]
+    if len(args) == 1:
+        args = args[0].split(" ")
+    for arg in args:
+        if arg.startswith("--load-extension=") and EXTENSION_DIR in arg[len("--load-extension="):].split(","):
+            return True
+    return False
+
+
+def browser_class(name):
+    name = str(name or "")
+    if APP_CLASS_RE.match(name):
+        return False
+    return bool(re.match(r"^(brave|chromium|microsoft-edge|vivaldi)", name, re.I))
+
+
+# --------------------------------------------------------------- activate / close
+
+def hypr_clients():
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, timeout=3).stdout
+        clients = json.loads(out[:4 * 1024 * 1024])
+        return clients if isinstance(clients, list) else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def ancestors(pid):
+    chain = []
+    for _ in range(6):
+        chain.append(pid)
+        try:
+            with open("/proc/%d/status" % pid) as status:
+                for line in status:
+                    if line.startswith("PPid:"):
+                        pid = int(line.split()[1])
+                        break
+        except (OSError, ValueError):
+            break
+        if pid <= 1:
+            break
+    return chain
+
+
+def pick_window(clients, pid, title):
+    """The browser window that now shows `title`, else its last focused one."""
+    pids = set(ancestors(pid))
+    own = [c for c in clients if c.get("pid") in pids and not APP_CLASS_RE.match(str(c.get("class", "")))]
+    if not own:
+        return None, False
+    if title:
+        for client in own:
+            shown = str(client.get("title", ""))
+            if shown == title or shown.startswith(title + " - "):
+                return client, True
+    own.sort(key=lambda c: c.get("focusHistoryID", 1 << 30))
+    return own[0], False
+
+
+def focus_window(pid, title):
+    client = None
+    for attempt in range(12):
+        client, sure = pick_window(hypr_clients(), pid, title)
+        if sure or client is None:
+            break
+        time.sleep(0.04)   # the window's title changes a moment after the tab does
+    if not client:
+        return
+    address = str(client.get("address", ""))
+    if not ADDRESS_RE.match(address):
+        return
+    lua = 'hl.dsp.focus({ window = "address:%s" })' % address
+    done = subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, timeout=3)
+    if done.returncode != 0 or b"error" in done.stdout.lower():
+        subprocess.run(["hyprctl", "dispatch", "focuswindow", "address:" + address], capture_output=True, timeout=3)
+
+
+def command_activate(key, tab):
+    reply = ask(socket_path(key), {"cmd": "activate", "tabId": int(tab)})
+    if not reply or not reply.get("ok"):
+        print(json.dumps({"ok": False, "error": clean_text((reply or {}).get("error") or "The browser did not answer.", 200)}))
+        return 1
+    focus_window(int(reply.get("pid") or 0), clean_text(reply.get("title"), 512))
+    print(json.dumps({"ok": True}))
+    return 0
+
+
+def command_simple(command, key, tab):
+    reply = ask(socket_path(key), {"cmd": command, "tabId": int(tab)})
+    ok = bool(reply and reply.get("ok"))
+    print(json.dumps({"ok": ok, "closed": int((reply or {}).get("closed") or 0)}))
+    return 0 if ok else 1
+
+
+def command_tabs(action, pairs):
+    """`tabs close a.sock:1 a.sock:2 b.sock:7`: one request per browser."""
+    if action not in TAB_ACTIONS:
+        raise SystemExit("browser-tab-search: unknown action")
+    by_key = {}
+    for pair in pairs[:MAX_TABS]:
+        key, _, tab = pair.rpartition(":")
+        if not SOCKET_RE.match(key) or not tab.isdigit():
+            raise SystemExit("browser-tab-search: expected KEY:TAB")
+        by_key.setdefault(key, []).append(int(tab))
+    done = 0
+    ok = True
+    for key, ids in by_key.items():
+        reply = ask(socket_path(key), {"cmd": "tabs", "action": action, "tabIds": ids})
+        ok = ok and bool(reply and reply.get("ok"))
+        done += int((reply or {}).get("done") or 0)
+    print(json.dumps({"ok": ok, "done": done}))
+    return 0 if ok else 1
+
+
+def web_request(text):
+    """{"query", "url"} from the overlay -> the request for the extension: the
+    site's address with the words in place of %s, or the words alone."""
+    try:
+        data = json.loads(text)
+        query = str(data.get("query") or "").strip()[:200]
+        template = str(data.get("url") or "")
+        address = str(data.get("address") or "").strip()
+    except (ValueError, AttributeError):
+        return None
+    # A typed address, opened as it is.
+    if address:
+        if len(address) > 2000 or not WEB_URL_RE.match(address):
+            return None
+        return {"cmd": "web", "query": address[:200], "url": address}
+    if not query:
+        return None
+    if not template:
+        return {"cmd": "web", "query": query}
+    if len(template) > 500 or "%s" not in template or not WEB_URL_RE.match(template):
+        return None
+    from urllib.parse import quote
+    return {"cmd": "web", "query": query, "url": template.replace("%s", quote(query, safe=""))}
+
+
+def command_bring(request, key):
+    """Restore or open something, then bring its window to the front."""
+    reply = ask(socket_path(key), request)
+    if not reply or not reply.get("ok"):
+        print(json.dumps({"ok": False, "error": clean_text((reply or {}).get("error") or "The browser did not answer.", 200)}))
+        return 1
+    focus_window(int(reply.get("pid") or 0), clean_text(reply.get("title"), 512))
+    print(json.dumps({"ok": True}))
+    return 0
+
+
+# --------------------------------------------------------------- connect / disconnect
+
+def manifest_path(browser_dir):
+    return os.path.join(CONFIG, browser_dir, "NativeMessagingHosts", HOST_NAME + ".json")
+
+
+def host_manifest():
+    return json.dumps({
+        "name": HOST_NAME,
+        "description": "Omarchy Browser Tab Search host",
+        "path": SELF,
+        "type": "stdio",
+        "allowed_origins": [ORIGIN],
+    }, indent=2) + "\n"
+
+
+def command_save_config():
+    """The overlay's settings, as one JSON object on stdin, replace the file.
+    It may name the sites the user searches, so it is kept 0600, and written
+    to a fresh inode so a file left readable before is not reused."""
+    text = sys.stdin.read(MAX_CONFIG + 1)
+    if len(text) > MAX_CONFIG:
+        return 1
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return 1
+    if not isinstance(data, dict):
+        return 1
+    write_file(CONFIG_FILE, json.dumps(data, indent=2, ensure_ascii=False) + "\n", 0o600)
+    return 0
+
+
+def write_file(path, text, mode=0o644):
+    """Replaces the file in one step, through a new file of `mode`. A
+    symlinked file (dotfiles) stays a symlink: its target is written."""
+    path = os.path.realpath(path)
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    temporary = path + ".browser-tab-search.tmp"
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.replace(temporary, path)
+
+
+MAX_FLAGS = 256 * 1024   # a flags file bigger than this is not one to edit
+
+
+def flag_lines(path):
+    try:
+        with open(path) as handle:
+            text = handle.read(MAX_FLAGS + 1)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text.splitlines() if len(text) <= MAX_FLAGS else None
+
+
+def extension_loaded(path):
+    lines = flag_lines(path) or []
+    for line in lines:
+        if line.strip().startswith("--load-extension="):
+            if EXTENSION_DIR in line.strip()[len("--load-extension="):].split(","):
+                return True
+    return False
+
+
+def ours(path):
+    """The extension, here or where an older version of the plugin kept it."""
+    return path == EXTENSION_DIR or path.startswith(PLUGIN_DIR + os.sep)
+
+
+def with_extension(lines, add):
+    """The flag file's lines with the extension added to, or taken from,
+    --load-extension. Paths into this plugin from before a move go too."""
+    out = []
+    seen = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("--load-extension="):
+            seen = True
+            paths = [p for p in stripped[len("--load-extension="):].split(",") if p and not ours(p)]
+            if add:
+                paths.append(EXTENSION_DIR)
+            if paths:
+                out.append("--load-extension=" + ",".join(paths))
+            continue
+        out.append(line)
+    if add and not seen:
+        out.append("--load-extension=" + EXTENSION_DIR)
+    return out
+
+
+def command_connect(add=True):
+    if "," in EXTENSION_DIR or any(ch.isspace() for ch in EXTENSION_DIR):
+        print(json.dumps({"ok": False, "error": "The plugin's folder has a comma or a space in its path."}))
+        return 1
+    hosts = []
+    for browser_dir in BROWSER_DIRS:
+        if not os.path.isdir(os.path.join(CONFIG, browser_dir)):
+            continue
+        target = manifest_path(browser_dir)
+        if add:
+            write_file(target, host_manifest())
+            hosts.append(browser_dir)
+        elif os.path.isfile(target):
+            os.unlink(target)
+            hosts.append(browser_dir)
+    flags = []
+    for name in FLAG_FILES:
+        path = os.path.join(CONFIG, name)
+        lines = flag_lines(path)
+        if lines is None:
+            continue
+        changed = with_extension(lines, add)
+        if changed != lines:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            write_file(path, "\n".join(changed) + "\n", mode)
+            flags.append(name)
+    print(json.dumps({"ok": True, "hosts": hosts, "flags": flags}))
+    return 0
+
+
+# --------------------------------------------------------------- main
+
+def main(argv):
+    if len(argv) > 1 and argv[1].startswith("chrome-extension://"):
+        run_host(argv[1])
+        return 0
+    command = argv[1] if len(argv) > 1 else ""
+    if command == "list":
+        command_list()
+        return 0
+    if command == "activate" and len(argv) == 4 and argv[3].isdigit():
+        return command_activate(argv[2], argv[3])
+    if command == "dedupe" and len(argv) == 4 and argv[3].isdigit():
+        return command_simple(command, argv[2], argv[3])
+    if command == "open" and len(argv) == 4 and argv[3].isdigit():
+        return command_bring({"cmd": "open", "token": int(argv[3])}, argv[2])
+    if command == "restore" and len(argv) == 4 and SESSION_RE.match(argv[3]):
+        return command_bring({"cmd": "restore", "sessionId": argv[3]}, argv[2])
+    if command == "move" and len(argv) == 5 and argv[3].isdigit() and argv[4] in ("1", "-1"):
+        reply = ask(socket_path(argv[2]), {"cmd": "move", "tabId": int(argv[3]), "step": int(argv[4])})
+        ok = bool(reply and reply.get("ok"))
+        print(json.dumps({"ok": ok}))
+        return 0 if ok else 1
+    if command == "tabs" and len(argv) >= 4:
+        return command_tabs(argv[2], argv[3:])
+    if command == "web" and len(argv) == 3:
+        request = web_request(sys.stdin.read(4096))
+        if not request:
+            return 2
+        return command_bring(request, argv[2])
+    if command == "save-config" and len(argv) == 2:
+        return command_save_config()
+    if command == "serve":
+        command_serve()
+        return 0
+    if command == "connect":
+        return command_connect(True)
+    if command == "disconnect":
+        return command_connect(False)
+    sys.stderr.write(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

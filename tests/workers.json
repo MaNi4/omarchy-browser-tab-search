@@ -1,0 +1,4 @@
+{
+  "_": "The service worker each released file name stands for. Browsers keep running a cached copy of an unpacked extension's worker, so changed code needs a new name: rename worker-N.js to worker-(N+1).js, point extension/chromium/manifest.json at it, and add its hash here (tests/test_browser_tab_search.py prints it).",
+  "worker-1.js": "0c737d7bd1f4ed2045a0c9404499a804aafe2548bd07b64a4280786f9e168d7b"
+}
